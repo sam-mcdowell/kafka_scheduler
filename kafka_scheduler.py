@@ -1,15 +1,14 @@
-from kafka_python import KafkaClient
-from pykafka.exceptions import SocketDisconnectedError
-from pykafka.protocol import PartitionFetchRequest
+from abc import ABCMeta, abstractmethod
+from multiprocessing import Process
+from kafka.client import KafkaClient
+from kafka.common import ConsumerTimeout
+from kafka.consumer import SimpleConsumer, KafkaConsumer
+from kafka.producer import SimpleProducer
 
 from math import log, floor
 import json
 
-from threading import Thread
 from time import sleep, time
-import re
-
-from datetime import datetime
 
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 QUEUE_DURATION_FORMAT="%Ss"
@@ -29,94 +28,187 @@ class KafkaScheduler():
         self.zookeeper_hosts = zookeeper_hosts
         self.input_topic = input_topic
         self.number_of_queues=number_of_queues
-        self.client = KafkaClient(hosts=self.kafka_hosts)
         self.queues = []
-        self.producers = {}
-        self.configure_queues()
-        self.running = True
+        self.configure_internal_queues()
+        self.configure_input_queue()
         self.start_workers()
 
-    def configure_queues(self):
+    def configure_internal_queues(self):
         for i in range(self.number_of_queues):
+            client = KafkaClient(hosts=self.kafka_hosts)
             queue_name = SCHEDULER_QUEUE_FORMAT.format(2**i)
-            print("configuring queue: {}".format(queue_name))
-            queue_topic = self.client.topics[queue_name]
-            queue_consumer = queue_topic.get_balanced_consumer(
-                consumer_group=CONSUMER_GROUP,
-                zookeeper_connect=self.zookeeper_hosts,
-                auto_start=False,
+            indexed_consumer = IndexedConsumer(self.input_topic, self.kafka_hosts)
+            queue_consumer = KafkaConsumer(
+                queue_name,
+                bootstrap_servers=self.kafka_hosts,
+                group_id=CONSUMER_GROUP,
+                consumer_timeout_ms=500,
             )
-            try:
-                queue_consumer.start()
-            except SocketDisconnectedError:
-                queue_consumer._zookeeper.restart()
-                queue_consumer.start()
-
-            queue_producer = queue_topic.get_producer()
-            queue_worker = Thread(target=self.watch_queue, args=(i, ))
+            queue_producer = SimpleProducer(client)
+            queue_duration = 2**i
             self.queues.append(
-                SchedulerQueue(
-                    queue_name,
-                    queue_topic,
+                InternalQueue(
                     queue_consumer,
+                    indexed_consumer,
                     queue_producer,
-                    queue_worker,
+                    self.number_of_queues,
+                    queue_duration,
                 )
             )
+
+    def configure_input_queue(self):
+        indexed_consumer = IndexedConsumer(self.input_topic, self.kafka_hosts)
+        queue_consumer = KafkaConsumer(
+            self.input_topic,
+            bootstrap_servers=self.kafka_hosts,
+            group_id=CONSUMER_GROUP
+        )
+        queue_producer = SimpleProducer(KafkaClient(hosts=self.kafka_hosts))
+        self.queues.append(
+            InputQueue(
+                queue_consumer,
+                indexed_consumer,
+                queue_producer,
+                self.number_of_queues
+            )
+        )
 
     def start_workers(self):
         for queue in self.queues:
-            queue.worker.start()
+            queue.start()
 
     def stop_workers(self):
         for queue in self.queues:
-            queue.worker.stop()
+            queue.terminate()
+
+
+class IndexedConsumer():
+    """
+    A simple consumer to retrieve messages from the input queue when it is time to send them
+    """
+    def __init__(self, input_topic, hosts):
+        self.input_topic = input_topic
+        self.consumer = KafkaConsumer(bootstrap_servers=hosts)
+
+    def retrieve_event(self, event_reference):
+        self.consumer.set_topic_partitions(
+            (
+                self.input_topic,
+                event_reference.partition,
+                event_reference.offset
+            )
+        )
+        message = self.consumer.next()
+        event = ScheduledEvent.from_dict(json.loads(message.value))
+        return event
+
+
+class SchedulerQueue(Process):
+    """
+    provides the basic functionality of storing and transferring events, and event references
+    """
+    __metaclass__ = ABCMeta
+
+    def __init__(self, consumer, indexed_consumer, producer, number_of_queues):
+        self.consumer = consumer
+        self.indexed_consumer = indexed_consumer
+        self.producer = producer
+        self.number_of_queues = number_of_queues
+        super(SchedulerQueue, self).__init__()
+        self.daemon = True
+
+    def run(self):
+        print("starting queue with consumer: {}".format(self.consumer))
+        self.watch_queue()
+
+    @abstractmethod
+    def watch_queue(self):
+        pass
 
     def calculate_next_queue(self, send_time):
-        time_remaining = time() - send_time
-        return int(min(
-            floor(
-                log(
-                    time_remaining,
-                    2
-                )
-            ),
-            self.number_of_queues
-        ))
+        time_remaining = send_time - time()
+        if time_remaining < 2:
+            index = 0
+        else:
+            index = min(floor(log(time_remaining, 2)), self.number_of_queues)
+        return int(index)
 
     def send_event(self, event_reference):
-        event = self.retrieve_event(event_reference)
-        if not self.producers.has_key(event.topic):
-            self.producers[event.topic] = self.client.topics[event.topic].get_producer()
-        self.producers[event.topic].produce([event.message])
+        """
+        requeues the original message into the appropriate topic once its send time has come
+        :param event_reference: reference to event to send
+        """
+        event = self.indexed_consumer.retrieve_event(event_reference)
+        self.producer.send_messages(event.topic, str(event.message))
 
     def handle_reference(self, event_reference):
         """
         Consumer method for schedule references. Determines whether the event is ready to be
         sent, or publishes a new reference to the appropriate schedule queue.
-        :param event_reference: re
-        :return:
+        :param event_reference: reference to event to be updated or sent along
         """
-        if event_reference.send_time > time():
+        if event_reference.send_time <= time():
             self.send_event(event_reference)
         else:
             event_reference.enqueue_time=time()
-            message = str(event_reference.to_dict())
+            message = json.dumps(event_reference.to_dict())
             queue_index = self.calculate_next_queue(event_reference.send_time)
-            self.queues[queue_index].producer.produce([message])
+            queue_topic = SCHEDULER_QUEUE_FORMAT.format(2**queue_index)
+            self.producer.send_messages(queue_topic, message)
 
-    def handle_incoming_schedule_events(self):
+
+class InternalQueue(SchedulerQueue):
+    """
+    defines an 'internal' queue, where references to scheduled events are sorted while
+    they wait to be sent
+    """
+    def __init__(self, consumer, indexed_consumer, producer, number_of_queues, duration):
+        self.duration = duration
+        super(InternalQueue, self).__init__(consumer, indexed_consumer, producer, number_of_queues)
+
+    def watch_queue(self):
+        """
+        task to watch a schedule queue, moving items through as necessary, sleeping
+        when the current event in the queue is due more than the queue duration in the future
+
+        :param queue: the queue to monitor
+        :type queue: SchedulerQueue
+        """
+        while True:
+            cutoff = time()
+            try:
+                for message in self.consumer:
+                    event_reference = ScheduledEventReference.from_dict(json.loads(message.value))
+                    self.handle_reference(event_reference)
+                    if event_reference.enqueue_time > cutoff:
+                        # we can assume that no events have been in the queue for longer than the this item
+                        # so we can safely sleep for a full queue_duration before proceeding
+                        break
+            except ConsumerTimeout:
+                # nothing currently in the queue, safe to sleep
+                pass
+            sleep(self.duration)
+
+
+class InputQueue(SchedulerQueue):
+    """
+    watches the input queue and sorts incoming events into the appropriate bins
+    """
+    def __init__(self, consumer, indexed_consumer, producer, number_of_queues):
+        super(InputQueue, self).__init__(consumer, indexed_consumer, producer, number_of_queues)
+
+    def watch_queue(self):
         """
         Main task that processes events from the input queue, and places them into
         the appropriate schedule queues based on their specified send time.
         """
-        topic = self.client.topics[self.input_topic]
-        consumer = topic.get_balanced_consumer()
-        for message in consumer:
+
+        for message in self.consumer:
             try:
-                event = ScheduledEvent(json.load(message.value))
+                event = ScheduledEvent.from_dict(json.loads(message.value))
             except:
                 print "malformed scheduled event, ignoring"
+                continue
 
             event_reference = ScheduledEventReference(
                 message.partition,
@@ -126,70 +218,6 @@ class KafkaScheduler():
             )
             self.handle_reference(event_reference)
 
-    def watch_queue(self, queue_index):
-        """
-        threadable task to watch a schedule queue, moving items through as necessary, sleeping
-        when the event in the queue is due more than the queue duration in the future
-
-        :param queue_index: the "index" for the worker to watch, correllates to a queue duration of
-                                2**queue_index
-        :type queue_index:
-        """
-        queue_duration = 2**queue_index
-        while self.running:
-            for message in self.queues[queue_index].consumer:
-                event_reference = ScheduledEventReference.from_dict(json.loads(message.value))
-                if event_reference.enqueue_time < time.time() + queue_duration:
-                    # we can assume that no events have been in the queue for longer than the this item
-                    # therefore, we can safely sleep for a full queue_duration before proceeding
-                    break
-                else:
-                    self.handle_reference(event_reference)
-            sleep(queue_duration)
-
-class MasterConsumer():
-    """
-    This is an incredibly hacky random access consumer. Random access isn't natively supported
-    by any of the python kafka clients, so this is  pretty fragile if the broker implementation
-    changes in pykafka
-    """
-    MAX_BYTES=2*1024
-    # this value is up for debate, but I _really_ hope we never have messages over 2 megs
-    # I would in fact recommend putting a specific message size limit on the input queue, and
-    # mirroring that setting here, as this value hugely affects performance.
-
-    def __init__(self, input_topic, client):
-        self.input_topic = input_topic
-        self.client = client
-
-    def retrieve_event(self, event_reference):
-        leader = self.client.topics[self.input_topic].partitions[event_reference.partition].leader
-        request = PartitionFetchRequest(
-            self.input_topic,
-            event_reference.partition,
-            event_reference.offset,
-            self.MAX_BYTES
-        )
-        response = leader.fetch_messages([request])
-        message = response.topics["test"][0].message[0]
-        if message.partition == event_reference.partition & message.offset == event_reference.offset :
-            return ScheduledEvent.from_dict(json.load(message.value))
-        else:
-            raise Exception("record not found")
-
-
-class SchedulerQueue():
-    """
-    a bucket of a given size in the scheduler, provides a convenient way to index
-    consumers and producers for each bucket
-    """
-    def __init__(self, name, topic, consumer, producer, worker):
-        self.name = name
-        self.topic = topic
-        self.consumer = consumer
-        self.producer = producer
-        self.worker = worker
-
 
 class ScheduledEvent():
 
@@ -198,8 +226,9 @@ class ScheduledEvent():
         self.message = message
         self.send_time = send_time
 
-    def from_dict(self, dict):
-        return ScheduledEvent(
+    @classmethod
+    def from_dict(cls, dict):
+        return cls(
             dict["topic"],
             dict["message"],
             dict["send_time"],
@@ -221,9 +250,18 @@ class ScheduledEventReference():
         self.enqueue_time = enqueue_time
         self.send_time = send_time
 
+    def __repr__(self):
+        return "{}: partition: {}, offset: {}, enqueue_time: {}, send_time: {}".format(
+            self.__class__,
+            self.partition,
+            self.offset,
+            self.enqueue_time,
+            self.send_time
+        )
 
-    def from_dict(self, dict):
-        return ScheduledEventReference(
+    @classmethod
+    def from_dict(cls, dict):
+        return cls(
             dict["partition"],
             dict["offset"],
             dict["enqueue_time"],
