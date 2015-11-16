@@ -2,47 +2,50 @@ from abc import ABCMeta, abstractmethod
 from multiprocessing import Process
 from kafka.client import KafkaClient
 from kafka.common import ConsumerTimeout
-from kafka.consumer import SimpleConsumer, KafkaConsumer
+from kafka.consumer import KafkaConsumer
 from kafka.producer import SimpleProducer
 
 from math import log, floor
 import json
-
+from logging import ERROR, basicConfig, getLogger
+import os
 from time import sleep, time
 
-DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-QUEUE_DURATION_FORMAT="%Ss"
-SCHEDULER_QUEUE_FORMAT="scheduler_{}s"
-CONSUMER_GROUP="schedulers"
+SCHEDULER_QUEUE_FORMAT = "scheduler_{}s"
+CONSUMER_GROUP = "schedulers"
+LOG_FILENAME = 'kafka_scheduler.log'
 
 
 class KafkaScheduler():
 
     def __init__(self,
                  kafka_hosts,
-                 zookeeper_hosts,
                  input_topic="scheduled_events",
                  number_of_queues=15):
-
         self.kafka_hosts = kafka_hosts
-        self.zookeeper_hosts = zookeeper_hosts
         self.input_topic = input_topic
-        self.number_of_queues=number_of_queues
+        self.number_of_queues = number_of_queues
         self.queues = []
         self.configure_internal_queues()
         self.configure_input_queue()
         self.start_workers()
 
+
     def configure_internal_queues(self):
+        """
+        configures the internal queues used hold references to events in the input queue
+        """
         for i in range(self.number_of_queues):
             client = KafkaClient(hosts=self.kafka_hosts)
             queue_name = SCHEDULER_QUEUE_FORMAT.format(2**i)
+            client.ensure_topic_exists(queue_name)
             indexed_consumer = IndexedConsumer(self.input_topic, self.kafka_hosts)
             queue_consumer = KafkaConsumer(
                 queue_name,
                 bootstrap_servers=self.kafka_hosts,
-                group_id=CONSUMER_GROUP,
-                consumer_timeout_ms=500,
+                group_id=queue_name,
+                consumer_timeout_ms=2000,
+                auto_commit_enable=False,
             )
             queue_producer = SimpleProducer(client)
             queue_duration = 2**i
@@ -57,6 +60,11 @@ class KafkaScheduler():
             )
 
     def configure_input_queue(self):
+        """
+        configures the input queue that other services can use to schedule an event to be delivered
+        """
+        client = KafkaClient(hosts=self.kafka_hosts)
+        client.ensure_topic_exists(self.input_topic)
         indexed_consumer = IndexedConsumer(self.input_topic, self.kafka_hosts)
         queue_consumer = KafkaConsumer(
             self.input_topic,
@@ -116,6 +124,16 @@ class SchedulerQueue(Process):
         self.number_of_queues = number_of_queues
         super(SchedulerQueue, self).__init__()
         self.daemon = True
+        self.logger = self.configure_logger()
+
+    def configure_logger(self):
+        config = basicConfig(
+            format='%(asctime)s.%(msecs)s:%(name)s:%(thread)d:%(levelname)s:%(process)d:%(message)s'
+        )
+        log = getLogger(config)
+        logfile = os.path.abspath(LOG_FILENAME)
+        log.setLevel(ERROR)
+        return log
 
     def run(self):
         print("starting queue with consumer: {}".format(self.consumer))
@@ -125,13 +143,12 @@ class SchedulerQueue(Process):
     def watch_queue(self):
         pass
 
-    def calculate_next_queue(self, send_time):
-        time_remaining = send_time - time()
-        if time_remaining < 2:
-            index = 0
+    def calculate_next_queue(self, delay):
+        if delay < 2:
+            queue = 1
         else:
-            index = min(floor(log(time_remaining, 2)), self.number_of_queues)
-        return int(index)
+            queue = int(2**min(floor(log(delay, 2)), self.number_of_queues))
+        return SCHEDULER_QUEUE_FORMAT.format(queue)
 
     def send_event(self, event_reference):
         """
@@ -147,15 +164,14 @@ class SchedulerQueue(Process):
         sent, or publishes a new reference to the appropriate schedule queue.
         :param event_reference: reference to event to be updated or sent along
         """
-        if event_reference.send_time <= time():
+        delay_remaning = round(event_reference.send_time - time())
+        if delay_remaning < 0:
             self.send_event(event_reference)
         else:
             event_reference.enqueue_time=time()
             message = json.dumps(event_reference.to_dict())
-            queue_index = self.calculate_next_queue(event_reference.send_time)
-            queue_topic = SCHEDULER_QUEUE_FORMAT.format(2**queue_index)
+            queue_topic = self.calculate_next_queue(delay_remaning)
             self.producer.send_messages(queue_topic, message)
-
 
 class InternalQueue(SchedulerQueue):
     """
@@ -169,25 +185,41 @@ class InternalQueue(SchedulerQueue):
     def watch_queue(self):
         """
         task to watch a schedule queue, moving items through as necessary, sleeping
-        when the current event in the queue is due more than the queue duration in the future
+        when the current event in the queue was added after the current pass was started
 
         :param queue: the queue to monitor
         :type queue: SchedulerQueue
         """
         while True:
-            cutoff = time()
+            start = time()
+            next = start + self.duration
+            new_messages = False
             try:
                 for message in self.consumer:
                     event_reference = ScheduledEventReference.from_dict(json.loads(message.value))
-                    self.handle_reference(event_reference)
-                    if event_reference.enqueue_time > cutoff:
-                        # we can assume that no events have been in the queue for longer than the this item
+                    if event_reference.enqueue_time > start:
+                        # we can assume that no events have been in the queue for longer than this item
                         # so we can safely sleep for a full queue_duration before proceeding
+                        self.consumer.set_topic_partitions(
+                            (
+                                self.consumer._topics[0][0],
+                                message.partition,
+                                message.offset
+                            )
+                        )
                         break
+                    else:
+                        self.handle_reference(event_reference)
+                        self.consumer.task_done(message)
+                        new_messages = True
             except ConsumerTimeout:
                 # nothing currently in the queue, safe to sleep
                 pass
-            sleep(self.duration)
+            if new_messages:
+                self.consumer.commit()
+            sleep_time = next - time()
+            if sleep_time > 0:
+                sleep(sleep_time)
 
 
 class InputQueue(SchedulerQueue):
