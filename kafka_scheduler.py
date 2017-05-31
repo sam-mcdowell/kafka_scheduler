@@ -30,7 +30,6 @@ class KafkaScheduler():
         self.configure_input_queue()
         self.start_workers()
 
-
     def configure_internal_queues(self):
         """
         configures the internal queues used hold references to events in the input queue
@@ -128,12 +127,12 @@ class SchedulerQueue(Process):
 
     def configure_logger(self):
         config = basicConfig(
-            format='%(asctime)s.%(msecs)s:%(name)s:%(thread)d:%(levelname)s:%(process)d:%(message)s'
+            format='%(asctime)s.%(msecs)s:%(name)s:%(thread)d:%(levelname)s:%(process)d:%(message)s',
+            filename=os.path.abspath(LOG_FILENAME),
         )
-        log = getLogger(config)
-        logfile = os.path.abspath(LOG_FILENAME)
-        log.setLevel(ERROR)
-        return log
+        schedule_log = getLogger(config)
+        schedule_log.setLevel(ERROR)
+        return schedule_log
 
     def run(self):
         print("starting queue with consumer: {}".format(self.consumer))
@@ -144,6 +143,11 @@ class SchedulerQueue(Process):
         pass
 
     def calculate_next_queue(self, delay):
+        """
+        Calculates the greatest power of two that is less than the remaining delay on an event.
+        :param delay: seconds till event should be sent
+        :return: name of the queue to move this reference to
+        """
         if delay < 2:
             queue = 1
         else:
@@ -198,8 +202,7 @@ class InternalQueue(SchedulerQueue):
                 for message in self.consumer:
                     event_reference = ScheduledEventReference.from_dict(json.loads(message.value))
                     if event_reference.enqueue_time > start:
-                        # we can assume that no events have been in the queue for longer than this item
-                        # so we can safely sleep for a full queue_duration before proceeding
+                        # if we don't explicitly set the offset here, we seem to sometimes drop references
                         self.consumer.set_topic_partitions(
                             (
                                 self.consumer._topics[0][0],
@@ -207,6 +210,8 @@ class InternalQueue(SchedulerQueue):
                                 message.offset
                             )
                         )
+                        # we can assume that no events have been in the queue for longer than this item
+                        # so we can safely sleep for a full queue_duration before proceeding
                         break
                     else:
                         self.handle_reference(event_reference)
